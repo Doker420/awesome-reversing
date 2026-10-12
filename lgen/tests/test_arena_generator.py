@@ -783,3 +783,115 @@ async def test_dom_promo_video_without_result_card_is_ignored(monkeypatch, tmp_p
     with pytest.raises(Exception):
         await gen.wait_for_video(timeout=1, output_dir=str(tmp_path))
     assert CTA_URL not in fetched
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Капча: клик по чекбоксу reCAPTCHA/Turnstile внутри iframe
+#   Боевой лог: «Captcha click failed: Timeout 10000ms exceeded» — старый код
+#   ждал видимый body/чекбокс во фрейме, выбранном по URL, и зависал.
+# ═══════════════════════════════════════════════════════════════════
+class _CaptchaMouse:
+    def __init__(self, clicks):
+        self.clicks = clicks
+
+    async def move(self, x, y, steps=None):
+        pass
+
+    async def click(self, x, y, delay=None):
+        self.clicks.append((x, y))
+
+
+class _CaptchaIframe:
+    async def bounding_box(self):
+        return {"x": 100, "y": 200, "width": 304, "height": 78}
+
+
+class _CaptchaPage:
+    def __init__(self, clicks, widget=True, modal=False):
+        self.mouse = _CaptchaMouse(clicks)
+        self.frames = []
+        self._widget = widget
+        self._modal = modal
+
+    async def query_selector(self, sel):
+        if "recaptcha/api2/anchor" in sel and self._widget:
+            return _CaptchaIframe()
+        if "security verification" in sel and self._modal:
+            return object()
+        return None
+
+
+async def test_captcha_click_targets_checkbox_inside_iframe():
+    clicks = []
+    gen = ag.ArenaGenerator()
+    gen.page = _CaptchaPage(clicks)
+    assert await gen._click_captcha_checkbox() is True
+    x, y = clicks[0]
+    # левый край виджета (x + 28), по вертикали по центру
+    assert 120 <= x <= 140
+    assert 230 <= y <= 270
+
+
+async def test_captcha_click_without_widget_does_not_click():
+    clicks = []
+    gen = ag.ArenaGenerator()
+    gen.page = _CaptchaPage(clicks, widget=False)
+    assert await gen._click_captcha_checkbox() is False
+    assert clicks == []
+
+
+async def test_captcha_done_when_modal_gone():
+    gen = ag.ArenaGenerator()
+    gen.page = _CaptchaPage([], modal=False)
+    assert await gen._wait_captcha_done(timeout=3) is True
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Ложная ошибка «Arena вернула ошибку»: в меню режимов есть подпись
+#   «Not available for Video» — это не ошибка генерации.
+# ═══════════════════════════════════════════════════════════════════
+def _noop_video_handlers(gen):
+    async def _false(*a, **kw):
+        return False
+
+    gen.dismiss_got_it = _false
+    gen.ensure_consent = _false
+    gen.handle_captcha = _false
+
+
+async def test_static_ui_text_is_not_reported_as_error(monkeypatch, tmp_path):
+    gen = ag.ArenaGenerator()
+    gen.video_poll_seconds = 0.05
+    gen.video_start_timeout = 0.3
+    _noop_video_handlers(gen)
+
+    async def fake_state():
+        return {"videos": [], "dlButtons": 0, "editSiblings": 0, "stop": False, "spinning": False,
+                "generating": False, "errorText": "Side by Side Not available for Video", "url": ""}
+
+    monkeypatch.setattr(gen, "_video_state", fake_state)
+    with pytest.raises(Exception) as exc:
+        await gen.wait_for_video(timeout=2, output_dir=str(tmp_path))
+    assert "вернула ошибку" not in str(exc.value)
+    assert "не стартовала" in str(exc.value)
+
+
+async def test_real_moderation_error_after_start_is_reported(monkeypatch, tmp_path):
+    gen = ag.ArenaGenerator()
+    gen.video_poll_seconds = 0.05
+    _noop_video_handlers(gen)
+    states = iter([
+        {"videos": [], "dlButtons": 0, "editSiblings": 0, "stop": True, "spinning": True,
+         "generating": True, "errorText": "", "url": ""},
+        {"videos": [], "dlButtons": 0, "editSiblings": 0, "stop": False, "spinning": False,
+         "generating": False, "errorText": "Your prompt was blocked by moderation", "url": ""},
+    ])
+
+    async def fake_state():
+        return next(states)
+
+    monkeypatch.setattr(gen, "_video_state", fake_state)
+    with pytest.raises(Exception) as exc:
+        await gen.wait_for_video(timeout=5, output_dir=str(tmp_path))
+    assert "вернула ошибку" in str(exc.value)
+    assert "moderation" in str(exc.value)

@@ -186,6 +186,8 @@ class ArenaGenerator:
         self.video_poll_seconds = float(os.getenv("ARENA_VIDEO_POLL_SECONDS", "8"))
         self.download_wait_seconds = float(os.getenv("ARENA_DOWNLOAD_WAIT_SECONDS", "25"))
         self.download_click_interval = float(os.getenv("ARENA_DOWNLOAD_CLICK_SECONDS", "20"))
+        # сколько ждать, пока Arena реально начнёт генерацию видео (Stop / индикатор / карточка)
+        self.video_start_timeout = float(os.getenv("ARENA_VIDEO_START_SECONDS", "120"))
 
     # ═════════════════════════════════════════════════════════
     # Инициализация браузера
@@ -193,8 +195,10 @@ class ArenaGenerator:
     async def init_browser(self):
         self.playwright = await async_playwright().start()
 
+        # ARENA_HEADLESS=0 — окно браузера (нужен X-сервер, например xvfb-run).
+        # reCAPTCHA/Cloudflare заметно чаще пропускают не-headless браузер.
         self.browser = await self.playwright.chromium.launch(
-            headless=True,
+            headless=os.getenv("ARENA_HEADLESS", "1").strip().lower() not in ("0", "false", "no"),
             args=[
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -599,6 +603,78 @@ class ArenaGenerator:
             logger.warning("⚠️ Модалку согласия не удалось закрыть — генерация может не стартовать")
         return not still_open
 
+    # Виджеты проверки: reCAPTCHA v2 (anchor = чекбокс «Я не робот») и Cloudflare Turnstile
+    CAPTCHA_IFRAME_SELECTORS = (
+        "iframe[src*='recaptcha/api2/anchor']",
+        "iframe[src*='recaptcha/enterprise/anchor']",
+        "iframe[src*='challenges.cloudflare.com']",
+        "iframe[src*='turnstile']",
+        "iframe[title*='reCAPTCHA' i]",
+    )
+
+    async def _find_captcha_widget(self):
+        """Находим iframe виджета на странице и его размеры (не фрейм по URL — тот бывает невидимым)."""
+        for sel in self.CAPTCHA_IFRAME_SELECTORS:
+            try:
+                el = await self.page.query_selector(sel)
+            except Exception:
+                el = None
+            if not el:
+                continue
+            try:
+                box = await el.bounding_box()
+            except Exception:
+                box = None
+            if box and box.get("width", 0) > 20 and box.get("height", 0) > 20:
+                return el, box, sel
+        return None, None, ""
+
+    async def _click_captcha_checkbox(self) -> bool:
+        """Кликаем по чекбоксу виджета «по-человечески»: мышью по координатам у левого края."""
+        el, box, sel = None, None, ""
+        for _ in range(5):
+            el, box, sel = await self._find_captcha_widget()
+            if box:
+                break
+            await asyncio.sleep(1)
+        if not box:
+            logger.warning("Captcha click failed: виджет reCAPTCHA/Cloudflare не найден на странице")
+            await self._log_frames()
+            return False
+        try:
+            # чекбокс reCAPTCHA (304×78) и Turnstile (300×65) — у левого края, по вертикали по центру
+            x = box["x"] + 28 + random.uniform(-2, 2)
+            y = box["y"] + box["height"] / 2 + random.uniform(-2, 2)
+            await self.page.mouse.move(x, y, steps=12)
+            await asyncio.sleep(random.uniform(0.3, 0.7))
+            await self.page.mouse.click(x, y, delay=120)
+            logger.info(f"Captcha checkbox clicked ({sel}, x={x:.0f}, y={y:.0f}) ✅")
+            return True
+        except Exception as e:
+            logger.warning(f"Captcha click failed: {e}")
+            return False
+
+    async def _wait_captcha_done(self, timeout: float = 40) -> bool:
+        """True, когда экран проверки исчез (нет текста и нет iframe виджета с картинкой)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                modal = await self.page.query_selector('text=/security verification/i')
+            except Exception:
+                modal = None
+            if not modal:
+                return True
+            await asyncio.sleep(1)
+        return False
+
+    async def _log_frames(self):
+        """Диагностика: какие фреймы есть на странице — чтобы понять, что именно не нашли."""
+        try:
+            urls = [f.url[:120] for f in self.page.frames]
+            logger.warning(f"Фреймы на странице ({len(urls)}): {urls}")
+        except Exception:
+            pass
+
     async def handle_captcha(self, wait_seconds: int = 5):
         """reCAPTCHA / Cloudflare — как раньше, но с защитой от зависания."""
         try:
@@ -623,46 +699,16 @@ class ArenaGenerator:
         logger.info("🔒 Security Verification (reCAPTCHA/Cloudflare) detected")
         await asyncio.sleep(1.5)
 
-        frame = None
-        for _ in range(5):
-            for f in self.page.frames:
-                if 'recaptcha' in (f.url or '') or 'challenges.cloudflare.com' in (f.url or ''):
-                    frame = f
-                    break
-            if frame:
-                break
-            await asyncio.sleep(1)
-
-        try:
-            if frame:
-                anchor = await frame.wait_for_selector('#recaptcha-anchor, input[type="checkbox"], body', timeout=10000)
-                if anchor:
-                    box = await anchor.bounding_box()
-                    if box:
-                        x = box['x'] + box['width'] / 2 + random.uniform(-2, 2)
-                        y = box['y'] + box['height'] / 2 + random.uniform(-2, 2)
-                        await self.page.mouse.move(x, y, steps=12)
-                        await asyncio.sleep(random.uniform(0.3, 0.7))
-                        await self.page.mouse.click(x, y, delay=120)
-                        logger.info("Captcha checkbox clicked (human-like) ✅")
-                    else:
-                        await anchor.click(delay=120)
-            else:
-                cb = await self.page.query_selector('[role="checkbox"], input[type="checkbox"]')
-                if cb:
-                    await cb.click(delay=120)
-                    logger.info("Captcha checkbox clicked (page-level) ✅")
-        except Exception as e:
-            logger.warning(f"Captcha click failed: {e}")
+        clicked = await self._click_captcha_checkbox()
+        if not clicked:
             return False
 
-        try:
-            await self.page.wait_for_selector(
-                'text=/security verification/i', state='detached', timeout=30000
-            )
-            logger.info("Captcha modal closed ✅")
-        except Exception:
-            logger.warning("Captcha modal still visible (possibly image challenge)")
+        if not await self._wait_captcha_done(timeout=40):
+            logger.warning("Captcha modal still visible — возможно, появилась картинка-задание. "
+                           "Пройдите проверку вручную (см. README: «Проверка Cloudflare/reCAPTCHA»).")
+            await self._log_frames()
+            return False
+        logger.info("Captcha modal closed ✅")
 
         await self.save_cookies()
         return True
@@ -1517,7 +1563,7 @@ class ArenaGenerator:
                     const body = document.body ? (document.body.innerText || '').slice(0, 8000) : '';
                     const generating = /(generating|creating|rendering|queued)/i.test(body);
                     const errorText = (() => {
-                        const m = body.match(/(blocked|moderation|violat|failed|error|couldn't|could not|unable to|not available)/i);
+                        const m = body.match(/(moderation|violat|blocked by|content policy|generation failed|failed to generate|something went wrong|couldn't generate|could not generate)/i);
                         return m ? body.slice(Math.max(0, m.index - 80), m.index + 200) : '';
                     })();
                     const done = !!body.match(/(download|share|edit)/i);
@@ -1542,6 +1588,7 @@ class ArenaGenerator:
         last_consent_check = 0.0
         clicked_at = 0.0
         failed_urls = set()
+        started = False
 
         while (time.time() - start) < timeout:
             await self.handle_captcha(wait_seconds=0)
@@ -1560,6 +1607,8 @@ class ArenaGenerator:
             state = await self._video_state()
             # карточка результата (кнопка Download-иконка / Edit) появляется только по готовности
             result_ui = bool(state.get("dlButtons", 0) or state.get("editSiblings", 0))
+            if state.get("stop") or state.get("spinning") or state.get("generating") or result_ui:
+                started = True
 
             # кликаем по кнопкам скачивания (не чаще заданного интервала)
             ready = result_ui
@@ -1612,8 +1661,13 @@ class ArenaGenerator:
                 break
 
             finished = (not state.get("stop")) and (not state.get("spinning")) and not state.get("generating")
-            if finished and state.get("errorText") and not saved:
+            if finished and state.get("errorText") and not saved and started:
                 raise Exception(f"Arena вернула ошибку при генерации видео: {state['errorText'][:300]}")
+            if not started and (time.time() - start) > self.video_start_timeout:
+                raise Exception(
+                    f"Генерация видео не стартовала за {int(self.video_start_timeout)} с — промпт, вероятно, "
+                    f"не ушёл. Запустите diagnose_arena.py --mode video (см. FIXES.ru.md)"
+                )
 
             await asyncio.sleep(self.video_poll_seconds)
 
