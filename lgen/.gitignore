@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+generated/
+cookies/
+*.pyc
+debug_*.png
+*.zip
