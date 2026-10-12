@@ -699,3 +699,87 @@ async def test_submit_reports_reasons_in_error():
     text = str(exc.value)
     assert "arena.ai" in text
     assert "diagnose_arena.py" in text  # подсказка, что запустить для разбора
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Регрессия: промо-ролик Arena принимался за результат видео
+#   В боевом логе «Downloaded 2568 KB» ×2 — это agents-cta.mp4
+#   (2 630 448 байт = 2568.8 KiB). Бот отправлял его пользователю.
+# ═══════════════════════════════════════════════════════════════════
+CTA_URL = "https://arena.ai/videos/cta/agents-cta.mp4"
+REAL_URL = "https://cdn.example.net/results/abc123.mp4"
+BIG_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x01" * 60_000
+
+
+def test_cta_promo_video_is_not_a_media_result():
+    gen = ag.ArenaGenerator()
+    assert gen._media_kind(CTA_URL, "video/mp4") == ""
+    assert gen._media_kind(REAL_URL, "video/mp4") == "video"
+
+
+async def test_save_media_refuses_static_and_pre_send_urls(monkeypatch, tmp_path):
+    gen = ag.ArenaGenerator()
+    fetched = []
+
+    async def fake_fetch(url, timeout_ms=120000):
+        fetched.append(url)
+        return BIG_MP4, ".mp4"
+
+    monkeypatch.setattr(gen, "_fetch_bytes", fake_fetch)
+    input_preview = "https://cdn.example.net/input/preview.mp4"
+    gen._pre_send_media = {input_preview}
+
+    kw = dict(fallback_ext=".mp4", min_bytes=20000)
+    assert await gen._save_media_url(CTA_URL, str(tmp_path), "video", **kw) is None
+    assert await gen._save_media_url(input_preview, str(tmp_path), "video", **kw) is None
+    assert fetched == []  # статику и вложение даже не скачиваем
+
+    path = await gen._save_media_url(REAL_URL, str(tmp_path), "video", **kw)
+    assert path and path.endswith(".mp4")
+
+
+async def test_identical_files_are_saved_only_once(monkeypatch, tmp_path):
+    gen = ag.ArenaGenerator()
+
+    async def fake_fetch(url, timeout_ms=120000):
+        return BIG_MP4, ".mp4"  # оба «варианта» одинаковые — это ошибка выбора
+
+    monkeypatch.setattr(gen, "_fetch_bytes", fake_fetch)
+    kw = dict(fallback_ext=".mp4", min_bytes=20000)
+    first = await gen._save_media_url(REAL_URL, str(tmp_path), "video", index=0, **kw)
+    second = await gen._save_media_url(
+        "https://cdn.example.net/results/other.mp4", str(tmp_path), "video", index=1, **kw
+    )
+    assert first is not None
+    assert second is None
+
+
+async def test_dom_promo_video_without_result_card_is_ignored(monkeypatch, tmp_path):
+    """<video> промо-ролика на странице без карточки результата не должен попасть в выдачу."""
+    gen = ag.ArenaGenerator()
+    gen.start_capture(str(tmp_path / ".downloads"))
+    fetched = []
+
+    async def fake_state():
+        return {"videos": [CTA_URL], "dlButtons": 0, "editSiblings": 0,
+                "stop": False, "spinning": False, "generating": False, "errorText": ""}
+
+    async def fake_fetch(url, timeout_ms=120000):
+        fetched.append(url)
+        return BIG_MP4, ".mp4"
+
+    monkeypatch.setattr(gen, "_video_state", fake_state)
+    monkeypatch.setattr(gen, "_fetch_bytes", fake_fetch)
+    monkeypatch.setattr(gen, "consent_check_interval", 999)
+    gen.video_poll_seconds = 0.05
+
+    async def no_consent():
+        return False
+
+    monkeypatch.setattr(gen, "dismiss_got_it", no_consent)
+    monkeypatch.setattr(gen, "ensure_consent", no_consent)
+    monkeypatch.setattr(gen, "handle_captcha", no_consent)
+
+    with pytest.raises(Exception):
+        await gen.wait_for_video(timeout=1, output_dir=str(tmp_path))
+    assert CTA_URL not in fetched

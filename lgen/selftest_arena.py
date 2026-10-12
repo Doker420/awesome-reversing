@@ -55,6 +55,12 @@ def make_png(size: int = 512, rgb=(90, 40, 200)) -> bytes:
 
 PNG = make_png()
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 200_000  # «достаточно большое видео»
+# Каждый результат — свои байты (иначе дедупликация по содержимому отсеет второй вариант)
+def mp4_for(name: str) -> bytes:
+    return MP4 + name.encode()
+# Промо-ролик самой Arena, который лежит на странице /video ДО отправки.
+# Бот не должен принять его за результат (регрессия из боевого лога).
+CTA_MP4 = MP4 + b"promo-cta"
 
 # ─────────────────────────────────────────────────────────────
 # HTML-мок: повторяет боевые особенности arena.ai
@@ -73,6 +79,7 @@ PAGE = """<!DOCTYPE html>
   .justify-end {{ color: #666; }}
 </style></head>
 <body data-mode="{mode}">
+<video class="promo" src="/videos/cta/agents-cta.mp4" muted autoplay loop></video>
 <ol id="chat"></ol>
 
 <div id="composer">
@@ -248,11 +255,13 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
             return self._send(html, "text/html; charset=utf-8")
         if path == "/assets/result.png":
             return self._send(PNG, "image/png")
+        if path == "/videos/cta/agents-cta.mp4":
+            return self._send(CTA_MP4, "video/mp4")
         if path in ("/assets/video_1.mp4", "/assets/video_2.mp4"):
-            return self._send(MP4, "video/mp4")
+            return self._send(mp4_for(os.path.basename(path)), "video/mp4")
         if path.startswith("/download/"):
             name = os.path.basename(path)
-            body = MP4 if name.endswith(".mp4") else PNG
+            body = mp4_for(name) if name.endswith(".mp4") else PNG
             ctype = "video/mp4" if name.endswith(".mp4") else "image/png"
             return self._send(body, ctype, {"Content-Disposition": f'attachment; filename="{name}"'})
         return self._send(b"not found", "text/plain")
@@ -301,8 +310,14 @@ async def run_checks(port: int, only: list) -> int:
     async def check(name, coro):
         try:
             out = await coro
-            ok = bool(out) and all(os.path.exists(p) and os.path.getsize(p) > 0 for p in (out if isinstance(out, list) else [out]))
-            results.append((name, ok, str(out)))
+            files = out if isinstance(out, list) else [out]
+            ok = bool(out) and all(os.path.exists(p) and os.path.getsize(p) > 0 for p in files)
+            # регрессия: промо-ролик самой Arena не должен попасть в результаты
+            promo = [p for p in files if os.path.exists(p) and b"promo-cta" in open(p, "rb").read()]
+            if promo:
+                ok = False
+                print("  ❌ в результатах промо-ролик Arena (agents-cta) — регрессия")
+            results.append((name, ok, str(out) if not promo else f"промо-ролик в результатах: {promo}"))
             print(f"  {'✅' if ok else '❌'} {name}: {out}")
         except Exception as e:
             results.append((name, False, repr(e)))

@@ -37,6 +37,7 @@ import re
 import json
 import time
 import base64
+import hashlib
 import random
 import asyncio
 import logging
@@ -85,6 +86,15 @@ NEGATIVE_MEDIA_RE = re.compile(
     r"(favicon|sprite|logo|avatar|placeholder|spinner|loader|loading|blurhash|1x1\.|pixel\.gif"
     r"|icons?[-_.]|apple-touch|og-image|emoji|flag|gravatar|profile[-_]?(pic|photo)|badge|watermark"
     r"|/static/|/favicon|sentry|analytics|/icons/)",
+    re.I,
+)
+
+# Статика самой Arena (промо-ролики, аватарки, иконки, трекеры). Это НЕ результаты.
+# Баг из боевого лога: промо-ролик /videos/cta/agents-cta.mp4 (2 630 448 байт, в логе
+# «2568 KB») принимался за два сгенерированных видео через 1 с после Enter.
+ARENA_STATIC_MEDIA_RE = re.compile(
+    r"(/videos/cta/|/images/avatars/|/_next/static/|/cta/|apple-touch|favicon"
+    r"|gstatic\.com|googleusercontent\.com|recaptcha|google-analytics|posthog)",
     re.I,
 )
 
@@ -161,6 +171,12 @@ class ArenaGenerator:
 
         # Снимок изображений страницы ДО генерации (чтобы не отдать старое)
         self._baseline_images = set()
+        # Все медиа-URL, которые уже были на странице/в сети ДО отправки промпта.
+        # Это статика Arena и входные вложения, но не результат генерации.
+        self._pre_send_media = set()
+        self._seen_media = set()
+        # SHA-256 уже сохранённых файлов текущей задачи (два одинаковых варианта = баг)
+        self._saved_hashes = set()
 
         # Тайминги (секунды) — вынесены в атрибуты, чтобы их можно было
         # настраивать через .env или переопределять в тестах
@@ -287,6 +303,7 @@ class ArenaGenerator:
         self._stream_errors = []
         self._downloads = []
         self._download_dir = download_dir
+        self._saved_hashes = set()
         os.makedirs(download_dir, exist_ok=True)
 
     def stop_capture(self):
@@ -295,7 +312,7 @@ class ArenaGenerator:
     def _media_kind(self, url: str, content_type: str) -> str:
         if not url or url.startswith("data:"):
             return ""
-        if NEGATIVE_MEDIA_RE.search(url):
+        if NEGATIVE_MEDIA_RE.search(url) or ARENA_STATIC_MEDIA_RE.search(url):
             return ""
         ct = (content_type or "").split(";")[0].strip().lower()
         if "svg" in ct or urlparse(url).path.lower().endswith(".svg"):
@@ -319,7 +336,7 @@ class ArenaGenerator:
     async def _handle_response(self, response):
         try:
             url = response.url
-            if not self._capture_enabled:
+            if not self._capture_enabled and not self._media_kind(url, ""):
                 return
 
             headers = {}
@@ -330,6 +347,10 @@ class ArenaGenerator:
             content_type = headers.get("content-type", "")
 
             kind = self._media_kind(url, content_type)
+            if kind:
+                self._seen_media.add(url)
+            if not self._capture_enabled:
+                return
             if kind:
                 # отсекаем явно мелкие файлы (иконки), если размер известен
                 try:
@@ -911,6 +932,27 @@ class ArenaGenerator:
             logger.debug(f"generation state eval failed: {e}")
             return {}
 
+    async def _snapshot_media_before_send(self):
+        """Запоминаем все медиа, уже присутствующие ДО отправки (статика, вложения)."""
+        dom = []
+        try:
+            dom = await self.page.evaluate(
+                """() => Array.from(document.querySelectorAll('img, video, source'))
+                        .map(e => e.currentSrc || e.src || '').filter(Boolean)"""
+            )
+        except Exception as e:
+            logger.debug(f"media snapshot failed: {e}")
+        self._pre_send_media = set(dom or []) | set(self._seen_media)
+        logger.info(f"Снимок медиа до отправки: {len(self._pre_send_media)} URL (не будут считаться результатом)")
+
+    def _is_excluded_media(self, url: str) -> bool:
+        """True для URL, которые ни при каких условиях не являются результатом генерации."""
+        if not url or url.startswith("data:"):
+            return True
+        if ARENA_STATIC_MEDIA_RE.search(url):
+            return True
+        return url in self._pre_send_media
+
     async def _wait_submission(self, prompt: str, seconds: float = None) -> bool:
         """Ждём подтверждения, что промпт реально ушёл."""
         deadline = time.time() + float(seconds if seconds is not None else self.submit_check_seconds)
@@ -950,10 +992,10 @@ class ArenaGenerator:
                     const host = ta.closest('form') || ta.parentElement;
                     if (host && (host.contains(el) || el.contains(host))) return '';
                     const cls = (typeof el.className === 'string' && el.className)
-                        ? '.' + el.className.split(/\s+/).slice(0, 3).join('.') : '';
+                        ? '.' + el.className.split(/\\s+/).slice(0, 3).join('.') : '';
                     const role = el.getAttribute('role');
                     const aria = el.getAttribute('aria-label');
-                    const text = ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim().slice(0, 140);
+                    const text = ((el.innerText || el.textContent || '') + '').replace(/\\s+/g, ' ').trim().slice(0, 140);
                     return el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
                            (role ? '[role=' + role + ']' : '') + (aria ? '[aria-label=' + aria + ']' : '') +
                            cls + (text ? ' :: ' + text : '');
@@ -1073,6 +1115,7 @@ class ArenaGenerator:
         Возвращает True только если генерация действительно началась.
         """
         logger.info("Submitting prompt...")
+        await self._snapshot_media_before_send()
 
         await self.ensure_consent()
 
@@ -1211,7 +1254,8 @@ class ArenaGenerator:
     async def _save_media_url(self, url: str, output_dir: str, prefix: str, index: int = 0,
                               fallback_ext: str = ".png", min_bytes: int = 2000):
         """Скачиваем медиа по URL и сохраняем в output_dir."""
-        if not url or url.startswith("data:"):
+        if self._is_excluded_media(url):
+            logger.info(f"Пропуск (статика Arena или было на странице до отправки): {url[:120]}")
             return None
         body, ext = await self._fetch_bytes(url)
         if not body:
@@ -1220,6 +1264,12 @@ class ArenaGenerator:
         if len(body) < min_bytes:
             logger.debug(f"Слишком маленький ответ ({len(body)} байт) — пропускаем {url[:100]}")
             return None
+        # два одинаковых файла в одной задаче — это не два результата, а ошибка выбора
+        digest = hashlib.sha256(body).hexdigest()
+        if digest in self._saved_hashes:
+            logger.warning(f"Дубликат содержимого уже сохранён — пропускаю {url[:100]}")
+            return None
+        self._saved_hashes.add(digest)
         url_ext = _ext_from_url(url, "")
         if fallback_ext in (".mp4", ".webm") and url_ext in VIDEO_EXTS:
             ext = url_ext  # это видео — ссылка надёжнее content-type
@@ -1508,9 +1558,11 @@ class ArenaGenerator:
                 break
 
             state = await self._video_state()
+            # карточка результата (кнопка Download-иконка / Edit) появляется только по готовности
+            result_ui = bool(state.get("dlButtons", 0) or state.get("editSiblings", 0))
 
             # кликаем по кнопкам скачивания (не чаще заданного интервала)
-            ready = state.get("dlButtons", 0) or state.get("editSiblings", 0)
+            ready = result_ui
             if ready and (time.time() - clicked_at) > self.download_click_interval:
                 clicked_at = time.time()
                 clicked = await self._click_download_candidates()
@@ -1525,7 +1577,8 @@ class ArenaGenerator:
             # прямые ссылки на mp4 из сети/SSE
             urls = []
             urls += list(self._stream_urls)
-            urls += [v for v in state.get("videos", []) if v and not v.startswith("blob:")]
+            if result_ui:  # <video> на странице без карточки результата — это промо, не результат
+                urls += [v for v in state.get("videos", []) if v and not v.startswith("blob:")]
             urls += [v["url"] for v in self._captured["video"]]
             for url in urls:
                 if len(saved) >= expected:
@@ -1540,7 +1593,7 @@ class ArenaGenerator:
                     failed_urls.add(url)
 
             # blob:-видео — тянем через fetch внутри страницы
-            if len(saved) < expected:
+            if len(saved) < expected and result_ui:
                 for v in state.get("videos", []):
                     if not v.startswith(("blob:", "data:")):
                         continue
