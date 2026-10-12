@@ -50,6 +50,14 @@ class FakeResponse:
         return {"content-type": self._ct}
 
 
+class FakeNetRequest:
+    """Событие запроса для page.on('request')."""
+
+    def __init__(self, method, url):
+        self.method = method
+        self.url = url
+
+
 class FakeRequest:
     def __init__(self, page):
         self.page = page
@@ -285,6 +293,10 @@ class FakePage:
     async def screenshot(self, path=None, **kw):
         self.write_png(path)
 
+    def _emit(self, event, obj):
+        for h in self._handlers.get(event, []):
+            h(obj)
+
     def _emit_download(self, name="arena_result.png"):
         dl = FakeDownload(name)
         for h in self._handlers.get("download", []):
@@ -320,6 +332,8 @@ class FakePage:
             return
         self.submitted = True
         self.generating = True
+        # реальная отправка уходит запросом на stream — это и видит бот
+        self._emit("request", FakeNetRequest("POST", "https://arena.ai/nextjs-api/stream/create-evaluation"))
         if self.result_ready:
             self.generating = False
 
@@ -393,7 +407,7 @@ class FakePage:
                 "editorEmpty": not self.prompt_value.strip(),
                 "generating": self.generating,
                 "stop": self.generating,
-                "promptInPage": bool(self.prompt_value) and self.submitted,
+                "promptInPage": (bool(self.prompt_value) and self.submitted) or getattr(self, "echo_prompt", False),
                 "hasDownloadOrEdit": self.result_ready,
                 "url": self._url,
             }
@@ -471,6 +485,8 @@ def make_generator(page: FakePage, tmp_path=None):
 
     # download-события страницы должен ловить обработчик генератора
     page.on("download", gen._on_download)
+    # запросы страницы — по ним бот подтверждает, что промпт ушёл (как в _attach_page_handlers)
+    page.on("request", gen._on_request)
     gen._page_handlers_attached = True
 
     # ускоряем тайминги, чтобы тесты шли секунды, а не минуты
@@ -895,3 +911,24 @@ async def test_real_moderation_error_after_start_is_reported(monkeypatch, tmp_pa
         await gen.wait_for_video(timeout=5, output_dir=str(tmp_path))
     assert "вернула ошибку" in str(exc.value)
     assert "moderation" in str(exc.value)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# «Промт не ушёл» для видео: бот считал отправку успешной по тексту на странице
+#   Теперь успех — только по POST /nextjs-api/stream, Stop или сообщению пользователя.
+# ═══════════════════════════════════════════════════════════════════
+async def test_echoed_prompt_text_is_not_proof_of_sending():
+    page = FakePage()
+    page.echo_prompt = True  # текст промпта «виден» на странице, но запроса нет
+    page._submit = lambda: asyncio.sleep(0)  # type: ignore
+    gen = make_generator(page)
+    with pytest.raises(Exception) as exc:
+        await gen.submit_prompt("некоторый промпт", mode="video")
+    assert "не ушёл" in str(exc.value)
+
+
+async def test_success_is_backed_by_stream_request():
+    page = FakePage()
+    gen = make_generator(page)
+    assert await gen.submit_prompt("neon city", mode="image") is True
+    assert gen._stream_posts, "успех должен подтверждаться сетевым запросом"

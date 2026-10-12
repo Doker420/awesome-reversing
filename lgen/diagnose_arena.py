@@ -657,7 +657,7 @@ async def run(args):
                 await asyncio.sleep(max(0.1, (t_start + wait) - time.time()))
                 st = await page.evaluate(STATE_JS)
                 say(f"  +{wait}с: {st}")
-                if st.get("stop") or st.get("generating") or (st.get("textareaValueLen") == 0 and "c/" in st.get("url", "")):
+                if _net["stream_req"] or st.get("stop") or st.get("generating") or (st.get("textareaValueLen") == 0 and "c/" in st.get("url", "")):
                     sent = True
                     break
             stage("Enter отправил промпт", sent, f"состояние: {st}")

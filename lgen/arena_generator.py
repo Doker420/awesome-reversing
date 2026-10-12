@@ -177,6 +177,9 @@ class ArenaGenerator:
         self._seen_media = set()
         # SHA-256 уже сохранённых файлов текущей задачи (два одинаковых варианта = баг)
         self._saved_hashes = set()
+        # Доказательство отправки: время POST на /nextjs-api/stream и отметка начала submit_prompt
+        self._stream_posts = []
+        self._submit_mark = 0.0
 
         # Тайминги (секунды) — вынесены в атрибуты, чтобы их можно было
         # настраивать через .env или переопределять в тестах
@@ -269,6 +272,7 @@ class ArenaGenerator:
             return
         try:
             self.page.on("response", self._on_response)
+            self.page.on("request", self._on_request)
             self.page.on("download", self._on_download)
             self.context.on("page", lambda p: self._attach_to_page(p))
         except Exception as e:
@@ -279,9 +283,21 @@ class ArenaGenerator:
         """Новые вкладки (иногда Arena открывает результат в новой вкладке)."""
         try:
             page.on("response", self._on_response)
+            page.on("request", self._on_request)
             page.on("download", self._on_download)
         except Exception:
             pass
+
+    def _on_request(self, request):
+        """Фиксируем реальный запрос отправки промпта: POST на /nextjs-api/stream."""
+        try:
+            if request.method == "POST" and "/nextjs-api/stream" in request.url:
+                self._stream_posts.append(time.time())
+        except Exception:
+            pass
+
+    def _request_sent_since_mark(self) -> bool:
+        return any(t >= self._submit_mark for t in self._stream_posts)
 
     async def close_browser(self):
         for task in list(self._stream_tasks) + list(self._response_tasks):
@@ -956,19 +972,21 @@ class ArenaGenerator:
                     const head = body.slice(0, 6000);
 
                     const stopBtn = document.querySelector("button[aria-label='Stop generation']");
-                    const stopText = Array.from(document.querySelectorAll('button'))
-                        .some(b => vis(b) && /^(stop|stop generating)$/i.test((b.innerText || '').trim()));
                     const generating = /(generating|creating|rendering|processing your|queued|in queue)/i.test(head);
 
                     const part = (prompt || '').trim().slice(0, 40);
                     const promptInPage = part.length >= 8 ? body.includes(part) : false;
+                    // сообщение пользователя в ленте чата (не textarea и не скрытое зеркало поля)
+                    const userBubble = part.length >= 8 && Array.from(
+                        document.querySelectorAll("[data-role='user'], .justify-end")
+                    ).some(e => !e.matches('textarea, input') && (e.innerText || '').includes(part));
                     const hasDownloadOrEdit = Array.from(document.querySelectorAll('button'))
                         .some(b => vis(b) && /^(edit)$/i.test((b.innerText || '').trim()));
 
                     return {
                         editorEmpty, generating,
-                        stop: !!(stopBtn && vis(stopBtn)) || stopText,
-                        promptInPage, hasDownloadOrEdit,
+                        stop: !!(stopBtn && vis(stopBtn)),
+                        promptInPage, userBubble, hasDownloadOrEdit,
                         url: location.href,
                     };
                 }""",
@@ -1003,17 +1021,19 @@ class ArenaGenerator:
         """Ждём подтверждения, что промпт реально ушёл."""
         deadline = time.time() + float(seconds if seconds is not None else self.submit_check_seconds)
         while time.time() < deadline:
+            # 1) сеть: POST на /nextjs-api/stream ушёл после начала отправки — самое надёжное
+            if self._request_sent_since_mark():
+                logger.info("Отправка подтверждена: POST /nextjs-api/stream ✅")
+                return True
             st = await self._generation_state(prompt)
-            # 1) идёт генерация: кнопка Stop / индикатор «Generating»
-            if st.get("stop") or st.get("generating"):
+            # 2) идёт генерация: кнопка «Stop generation»
+            if st.get("stop"):
                 return True
-            # 2) промпт отрисован в чате как сообщение. Значение <textarea> в
-            #    innerText не попадает, поэтому совпадение = сообщение реально ушло.
-            if st.get("promptInPage"):
+            # 3) сообщение пользователя с текстом промпта в ленте чата
+            if st.get("userBubble"):
                 return True
-            # 3) ушли на страницу чата /c/… и composer опустел
-            if "/c/" in (st.get("url") or "") and st.get("editorEmpty"):
-                return True
+            # Текст «generating» и совпадение строки на странице доказательством НЕ считаются:
+            # это давало ложный успех (например, при скрытом зеркале поля ввода).
             await asyncio.sleep(0.7)
         return False
 
@@ -1161,6 +1181,7 @@ class ArenaGenerator:
         Возвращает True только если генерация действительно началась.
         """
         logger.info("Submitting prompt...")
+        self._submit_mark = time.time()
         await self._snapshot_media_before_send()
 
         await self.ensure_consent()
@@ -1181,10 +1202,6 @@ class ArenaGenerator:
 
         # Ждём, пока кнопка отправки станет активной (после загрузки фото)
         await self.wait_composer_ready(timeout=max(20.0, self.submit_check_seconds))
-
-        if await self._wait_submission(prompt, seconds=3):
-            logger.info("Generation already running ✅")
-            return True
 
         enter_retry_done = False
         for attempt in range(1, 4):
@@ -1242,6 +1259,8 @@ class ArenaGenerator:
             reason.append("не завершилась загрузка вложения")
         if st.get("editorEmpty"):
             reason.append("поле ввода пустое (текст не записался)")
+        if not self._request_sent_since_mark():
+            reason.append("запрос POST /nextjs-api/stream не ушёл (Arena не получила промпт)")
         raise Exception(
             "Не удалось отправить промпт на arena.ai. Причины: "
             + ("; ".join(reason) if reason else "модалка согласия или протухшая сессия Arena")
