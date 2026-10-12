@@ -466,7 +466,13 @@ class ArenaGenerator:
             clicked = await self.page.evaluate(
                 """(labels) => {
                     const wanted = labels.map(l => l.toLowerCase());
-                    const vis = (e) => !!(e && e.offsetParent !== null && e.getBoundingClientRect().width > 1);
+                    const vis = (e) => {
+                        if (!e) return false;
+                        const cs = getComputedStyle(e);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return false;
+                        const r = e.getBoundingClientRect();
+                        return r.width > 1 && r.height > 1;
+                    };
                     const btns = Array.from(document.querySelectorAll('button, [role="button"], a'));
                     for (const b of btns) {
                         if (!vis(b) || b.disabled) continue;
@@ -494,7 +500,13 @@ class ArenaGenerator:
         try:
             return bool(await self.page.evaluate(
                 """() => {
-                    const vis = (e) => !!(e && e.offsetParent !== null && e.getBoundingClientRect().width > 1);
+                    const vis = (e) => {
+                        if (!e) return false;
+                        const cs = getComputedStyle(e);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return false;
+                        const r = e.getBoundingClientRect();
+                        return r.width > 1 && r.height > 1;
+                    };
                     const re = /hit enter on your keyboard to agree|terms of use|privacy policy|by clicking .?agree|manage cookie preferences|accept cookies|i understand/i;
                     const dialogs = Array.from(document.querySelectorAll(
                         "[role='dialog'],[role='alertdialog'],[aria-modal='true'],[data-state='open']"));
@@ -864,7 +876,13 @@ class ArenaGenerator:
         try:
             return await self.page.evaluate(
                 """(prompt) => {
-                    const vis = (e) => !!(e && e.offsetParent !== null && e.getBoundingClientRect().width > 1);
+                    const vis = (e) => {
+                        if (!e) return false;
+                        const cs = getComputedStyle(e);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return false;
+                        const r = e.getBoundingClientRect();
+                        return r.width > 1 && r.height > 1;
+                    };
                     const ta = document.querySelector("textarea");
                     const editorEmpty = ta ? (ta.value || '').trim().length === 0 : true;
                     const body = document.body ? (document.body.innerText || '') : '';
@@ -911,6 +929,91 @@ class ArenaGenerator:
             await asyncio.sleep(0.7)
         return False
 
+    async def composer_blocker(self) -> str:
+        """
+        Что перекрывает поле ввода (если перекрывает).
+
+        Частая причина «промпт не ушёл»: поверх composer лежит модалка/баннер
+        (position:fixed портал), клик и Enter доходят до него, а не до поля.
+        Возвращает описание верхнего элемента или пустую строку.
+        """
+        try:
+            return await self.page.evaluate(
+                """() => {
+                    const ta = document.querySelector("textarea");
+                    if (!ta) return 'textarea не найден';
+                    const r = ta.getBoundingClientRect();
+                    if (r.width < 1 || r.height < 1) return 'textarea не отрисован (0x0)';
+                    const el = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                    if (!el) return 'elementFromPoint вернул null';
+                    if (el === ta || ta.contains(el) || el.contains(ta)) return '';
+                    const host = ta.closest('form') || ta.parentElement;
+                    if (host && (host.contains(el) || el.contains(host))) return '';
+                    const cls = (typeof el.className === 'string' && el.className)
+                        ? '.' + el.className.split(/\s+/).slice(0, 3).join('.') : '';
+                    const role = el.getAttribute('role');
+                    const aria = el.getAttribute('aria-label');
+                    const text = ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim().slice(0, 140);
+                    return el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
+                           (role ? '[role=' + role + ']' : '') + (aria ? '[aria-label=' + aria + ']' : '') +
+                           cls + (text ? ' :: ' + text : '');
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"composer_blocker failed: {e}")
+            return ''
+
+    async def send_state(self) -> dict:
+        """Состояние composer: активна ли кнопка отправки, не идёт ли загрузка файла."""
+        try:
+            state = await self.page.evaluate(
+                """() => {
+                    const ta = document.querySelector("textarea");
+                    if (!ta) return { found: false };
+                    const host = ta.closest('form') || ta.closest('div') || document;
+                    const send = host.querySelector("button[aria-label='Send message']")
+                        || host.querySelector("button[type='submit']")
+                        || Array.from(host.querySelectorAll('button')).filter(b => !!b.querySelector('svg')).pop();
+                    return {
+                        found: true,
+                        sendFound: !!send,
+                        sendDisabled: send ? (!!send.disabled || send.getAttribute('aria-disabled') === 'true') : null,
+                        textareaDisabled: !!ta.disabled || !!ta.readOnly,
+                        uploading: !!document.querySelector("[aria-busy='true'], [class*='upload' i][class*='progress' i], [class*='uploading' i]"),
+                    };
+                }"""
+            )
+            return state if isinstance(state, dict) else {}
+        except Exception as e:
+            logger.debug(f"send_state failed: {e}")
+            return {}
+
+    async def wait_composer_ready(self, timeout: float = 30) -> bool:
+        """
+        Ждём, пока composer станет рабочим.
+
+        После прикрепления файла Arena держит кнопку «Send message» выключенной,
+        пока вложение не обработается: Enter в этот момент просто ничего не делает.
+        """
+        deadline = time.time() + timeout
+        warned = False
+        while time.time() < deadline:
+            st = await self.send_state()
+            if not st or not st.get("found"):
+                return True  # состояние неизвестно — не блокируем
+            bad = st.get("textareaDisabled") or st.get("uploading") or (st.get("sendFound") and st.get("sendDisabled"))
+            if not bad:
+                return True
+            if not warned:
+                reason = ("идёт загрузка вложения" if st.get("uploading") else
+                          "кнопка Send неактивна" if st.get("sendDisabled") else
+                          "поле ввода заблокировано (disabled/readonly)")
+                logger.warning(f"⏳ Composer не готов: {reason} — ждём...")
+                warned = True
+            await asyncio.sleep(1)
+        logger.warning("⚠️ Composer так и не стал активным за отведённое время")
+        return False
+
     async def _click_send_button(self, mode: str = None) -> bool:
         """Клик по кнопке отправки (только когда composer включён)."""
         selectors = [
@@ -937,7 +1040,12 @@ class ArenaGenerator:
                     const ta = document.querySelector("textarea");
                     if (!ta) return false;
                     const host = ta.closest('form') || ta.closest('div') || document;
-                    const btns = Array.from(host.querySelectorAll('button')).filter(b => !b.disabled && b.offsetParent !== null);
+                    const btns = Array.from(host.querySelectorAll('button')).filter(b => {
+                        if (b.disabled) return false;
+                        const cs = getComputedStyle(b);
+                        const r = b.getBoundingClientRect();
+                        return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 1 && r.height > 1;
+                    });
                     const blocked = /(add file|upload|got it|edit|video|image|attach)/i;
                     const cand = btns.filter(b => {
                         const t = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '') + ' ' +
@@ -967,6 +1075,24 @@ class ArenaGenerator:
         logger.info("Submitting prompt...")
 
         await self.ensure_consent()
+
+        # Проверяем, не перекрыт ли composer модалкой/баннером
+        blocker = await self.composer_blocker()
+        if blocker:
+            logger.warning(f"⚠️ Поле ввода перекрыто: {blocker}")
+            try:
+                await self.page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            await self.ensure_consent(reload_after=True)
+            blocker2 = await self.composer_blocker()
+            if blocker2:
+                logger.warning(f"⚠️ Перекрытие осталось: {blocker2}")
+
+        # Ждём, пока кнопка отправки станет активной (после загрузки фото)
+        await self.wait_composer_ready(timeout=max(20.0, self.submit_check_seconds))
+
         if await self._wait_submission(prompt, seconds=3):
             logger.info("Generation already running ✅")
             return True
@@ -1014,12 +1140,23 @@ class ArenaGenerator:
             enter_retry_done = True
             await asyncio.sleep(1.5)
 
-        if enter_retry_done:
-            st = await self._generation_state(prompt)
-            logger.warning(f"Промпт не отправлен. Состояние страницы: {st}")
+        st = await self._generation_state(prompt)
+        blocker = await self.composer_blocker()
+        send = await self.send_state()
+        logger.warning(f"Промпт не отправлен. Состояние: {st} | перекрытие: {blocker or 'нет'} | composer: {send}")
+        reason = []
+        if blocker:
+            reason.append(f"поле ввода перекрыто «{blocker}»")
+        if send.get("sendDisabled"):
+            reason.append("кнопка Send неактивна")
+        if send.get("uploading"):
+            reason.append("не завершилась загрузка вложения")
+        if st.get("editorEmpty"):
+            reason.append("поле ввода пустое (текст не записался)")
         raise Exception(
-            "Не удалось отправить промпт на arena.ai (модалка согласия или composer недоступен). "
-            "Проверьте cookies/сессию Arena."
+            "Не удалось отправить промпт на arena.ai. Причины: "
+            + ("; ".join(reason) if reason else "модалка согласия или протухшая сессия Arena")
+            + ". Проверьте cookies/сессию Arena и запустите diagnose_arena.py."
         )
 
     # ═════════════════════════════════════════════════════════
@@ -1101,7 +1238,13 @@ class ArenaGenerator:
         try:
             return await self.page.evaluate(
                 """() => {
-                    const vis = (e) => !!(e && e.offsetParent !== null && e.getBoundingClientRect().width > 20);
+                    const vis = (e) => {
+                        if (!e) return false;
+                        const cs = getComputedStyle(e);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return false;
+                        const r = e.getBoundingClientRect();
+                        return r.width > 20 && r.height > 1;
+                    };
                     const isJunk = (src) => /(favicon|logo|avatar|sprite|icon|emoji|placeholder|blur|spinner)/i.test(src || '');
                     const out = [];
 
@@ -1153,7 +1296,13 @@ class ArenaGenerator:
         try:
             count = await self.page.evaluate(
                 """() => {
-                    const vis = (e) => !!(e && e.offsetParent !== null && e.getBoundingClientRect().width > 1);
+                    const vis = (e) => {
+                        if (!e) return false;
+                        const cs = getComputedStyle(e);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return false;
+                        const r = e.getBoundingClientRect();
+                        return r.width > 1 && r.height > 1;
+                    };
                     const danger = /(delete|remove|trash|share|report|publish|copy|regenerate|retry|hide|discard|like|dislike|edit|zoom|fullscreen|download app)/i;
                     const seen = new Set();
                     const targets = [];
@@ -1291,7 +1440,13 @@ class ArenaGenerator:
         try:
             return await self.page.evaluate(
                 """() => {
-                    const vis = (e) => !!(e && e.offsetParent !== null && e.getBoundingClientRect().width > 60);
+                    const vis = (e) => {
+                        if (!e) return false;
+                        const cs = getComputedStyle(e);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.05) return false;
+                        const r = e.getBoundingClientRect();
+                        return r.width > 60 && r.height > 1;
+                    };
                     const vids = Array.from(document.querySelectorAll('video')).filter(vis)
                         .map(v => v.currentSrc || v.src || (v.querySelector('source') ? v.querySelector('source').src : ''))
                         .filter(Boolean);

@@ -17,6 +17,7 @@ import base64
 import os
 import sys
 
+import pathlib
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -656,3 +657,45 @@ async def test_generate_image_raises_on_empty_result(tmp_path, monkeypatch):
 
     with pytest.raises(Exception):
         await gen.generate_image("a cat", output_dir=str(tmp_path))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3. Регрессии после разбора «промпт не ушёл»
+# ═══════════════════════════════════════════════════════════════════
+def test_no_offsetparent_visibility_checks():
+    """
+    offsetParent === null у position:fixed → модалка Terms of Use (fixed-портал)
+    считалась невидимой, Agree не нажимался, composer оставался disabled,
+    и промпт не уходил. Проверка должна идти через getComputedStyle.
+    """
+    src = pathlib.Path(ag.__file__).read_text(encoding="utf-8")
+    assert "offsetParent" not in src, "вернулась проверка видимости, ломающаяся на position:fixed"
+    assert "getComputedStyle" in src
+
+
+@pytest.mark.asyncio
+async def test_wait_composer_ready_does_not_block_on_unknown_state():
+    """Если состояние composer неизвестно — не блокируем отправку."""
+    page = FakePage()
+    gen = make_generator(page)
+    assert await gen.wait_composer_ready(timeout=1) is True
+
+
+@pytest.mark.asyncio
+async def test_composer_blocker_returns_empty_without_info():
+    page = FakePage()
+    gen = make_generator(page)
+    assert not await gen.composer_blocker()
+
+
+@pytest.mark.asyncio
+async def test_submit_reports_reasons_in_error():
+    """При провале отправки в тексте ошибки должны быть конкретные причины."""
+    page = FakePage()
+    page._submit = lambda: asyncio.sleep(0)  # composer «мёртвый»
+    gen = make_generator(page)
+    with pytest.raises(Exception) as exc:
+        await gen.submit_prompt("некоторый промпт", mode="video")
+    text = str(exc.value)
+    assert "arena.ai" in text
+    assert "diagnose_arena.py" in text  # подсказка, что запустить для разбора

@@ -18,6 +18,8 @@
 | 5 | `wait_for_video()` требовал **двух** видимых кнопок с текстом «Download» | в реальном UI кнопка скачивания — иконка (`aria-label="Download"`), рядом с ней кнопка `Edit`; в итоге «Video generation timed out» |
 | 6 | `wait_for_image()` умел только `expect_download` + скриншот элемента | при отсутствии кнопки «Download» результат не забирался |
 | 7 | Селекторы были «generic» (`textarea`, `button:has(svg)`) | могли попадать в чужие элементы (поиск, меню модели и т.п.) |
+| 8 | Проверка видимости через `offsetParent !== null` | у `position: fixed` (модалка Terms of Use) `offsetParent === null` → модалка считается невидимой, `Agree` не нажимается, composer остаётся `disabled` → **промпт не уходит** |
+| 9 | Отправка не ждала готовности composer | после загрузки фото кнопка `Send message` выключена, пока вложение обрабатывается → Enter ничего не делает |
 
 ## Что сделано
 
@@ -110,6 +112,59 @@ python selftest_arena.py edit animate
 5. Если ломается уже на этапе открытия страницы — обновите Playwright
    (`pip install -U playwright && playwright install chromium`): текущий pin
    `playwright==1.40.0` — 2023 год, а Arena активно меняет фронтенд.
+
+## Дополнение: «промпт не ушёл» — найдена ещё одна причина (проверка видимости)
+
+В проверках видимости элементов использовалось `el.offsetParent !== null`. У элементов
+с `position: fixed` (а модалка Terms of Use на arena.ai — это как раз fixed-портал
+`#root-portal-target`) **`offsetParent всегда `null`**, то есть модалка считалась
+НЕвидимой:
+
+* `consent_gate_open()` возвращал `false` → модалку не закрываем;
+* кнопка `Agree` тоже считалась невидимой → клик по ней не выполнялся;
+* composer оставался `disabled`, а Enter уходил в модалку → **промпт не отправлялся**.
+
+Исправлено: во всех JS-проверках видимость определяется через `getComputedStyle`
+(`display`/`visibility`/`opacity`) + `getBoundingClientRect()`, что одинаково верно
+и для fixed-порталов, и для обычных блоков. Дополнительно добавлены:
+
+* `composer_blocker()` — проверка через `document.elementFromPoint`, что поверх поля
+  ввода не лежит баннер/модалка (и лог «поле ввода перекрыто: …»);
+* `wait_composer_ready()` — ожидание, пока кнопка `Send message` станет активной
+  (после прикрепления фото Arena держит её выключенной, пока вложение не обработается —
+  Enter в этот момент не делает ничего);
+* итоговое исключение теперь перечисляет конкретные причины: перекрытие, неактивная
+  кнопка Send, незавершённая загрузка вложения, пустое поле.
+
+## Диагностика: `diagnose_arena.py` (без бота и без stealth)
+
+Отдельный автономный скрипт: только Playwright, без aiogram и без playwright-stealth,
+с пошаговым выводом состояния страницы — чтобы точно понять, где рвётся.
+
+```bash
+# на сервере, рядом с ботом (там, где cookies/arena_cookies.json)
+python diagnose_arena.py --mode video   --prompt "drone over a mountain lake"
+python diagnose_arena.py --mode animate --image photo.jpg --prompt "gentle motion"
+python diagnose_arena.py --mode image   --prompt "neon city at night" --wait 90
+python diagnose_arena.py --mode video   --prompt "..." --headed      # показать окно браузера
+```
+
+Что печатает и сохраняет (папка `diag_out/`):
+
+| Шаг | Что показывает |
+| :--- | :--- |
+| 0 | версии python/playwright, наличие браузера, cookies: сколько живых/просроченных, есть ли куки авторизации |
+| 1 | URL после перехода и редиректы, логин-стена, капча, все модалки с текстом и `position`, все `<textarea>`, все кнопки composer, что перекрывает поле ввода (`elementFromPoint`) |
+| 2 | закрытие согласия: какие кнопки реально нажаты, остался ли текст «hit Enter to agree» |
+| 3 | загрузка вложения: чем загрузилось, стал ли composer активным после этого |
+| 4 | ввод промпта: сколько символов реально в поле (fill / type / js-setter) |
+| 5 | Enter: состояние страницы через 1/3/6/10 секунд (пустое ли поле, есть ли Stop/Generating) |
+| 6 | если не ушло — клик по кнопке Send и результат |
+| 7 | сеть: `POST /nextjs-api/stream` (статус + первые строки ответа `a2:`/`a3:`/`ae:`), медиа-ответы, консоль браузера, ошибки страницы |
+| итог | REPORT со списком ✅/❌ и расшифровкой, что именно означает каждый пункт |
+
+Файлы для разбора: `diag_out/report.txt` (весь вывод текстом), `diag_out/07_final.png`,
+`diag_out/05_after_enter.png`, `diag_out/page.html` (полный HTML), `diag_out/*.json` (дампы).
 
 ## Новые переменные окружения (все опциональны)
 
