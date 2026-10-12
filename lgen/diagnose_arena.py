@@ -30,7 +30,7 @@ diagnose_arena.py — пошаговая диагностика отправки
 
     --headed        показать окно браузера (нужен X/рабочий стол)
     --no-cookies    не подгружать cookies/arena_cookies.json
-    --wait 90       сколько секунд слушать сеть после отправки
+    --wait 180      сколько секунд слушать сеть после отправки (видео — 300+)
 """
 
 import argparse
@@ -67,7 +67,12 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 OUT_DIR = "diag_out"
 _lines = []          # всё, что печатаем — дублируем в report.txt
 _results = []        # (этап, ok, пояснение)
-_net = {"stream_req": [], "stream_resp": [], "media": [], "other": []}
+_net = {"stream_req": [], "stream_resp": [], "media": [], "other": [],
+        "armed": False,          # True после нажатия отправки — только тогда медиа считаем результатом
+        "stream_status": None, "stream_done": False, "stream_body": "",
+        "stream_error": "", "stream_timeout": 600}
+# статические картинки/видео сайта (аватарки, CTA, favicon, reCAPTCHA) — не результат генерации
+STATIC_MEDIA_RE = re.compile(r"(/images/|/videos/cta/|favicon|apple-touch|gstatic\.com|googleusercontent|recaptcha)", re.I)
 _console = []
 _page_errors = []
 
@@ -186,7 +191,13 @@ DUMP_JS = r"""
             videos: document.querySelectorAll('video').length,
         },
         gateEnterText: /hit enter on your keyboard to agree/i.test(body),
-        termsText: /terms of use|privacy policy/i.test(body),
+        termsText: Array.from(document.querySelectorAll('body *')).some(e => {
+            if (getComputedStyle(e).position !== 'fixed') return false;
+            const r = e.getBoundingClientRect();
+            const t = e.innerText || '';
+            return r.width > 1 && r.height > 1 && /terms of use/i.test(t) && /agree/i.test(t);
+        }),
+        downloadButtons: document.querySelectorAll("button[aria-label='Download']").length,
         cookieText: /manage cookie preferences|accept cookies|this website uses cookies/i.test(body),
         loginWall: /(sign in to continue|continue with google|continue with email)/i.test(body.slice(0, 4000)),
         captcha: !!document.querySelector("iframe[src*='recaptcha'],iframe[src*='challenges.cloudflare.com'],#cf-wrapper,.cf-turnstile"),
@@ -219,6 +230,13 @@ STATE_JS = r"""
     };
 }
 """
+
+
+async def _count_downloads(page):
+    try:
+        return await page.evaluate("() => document.querySelectorAll(\"button[aria-label='Download']\").length")
+    except Exception:
+        return -1
 
 
 def dump_lines(d, prefix=""):
@@ -352,7 +370,12 @@ async def run(args):
     url = args.url or MODES.get(args.mode, MODES["image"])
     hr("0. Окружение")
     say(f"  python      : {sys.version.split()[0]}")
-    say(f"  playwright  : {getattr(playwright, '__version__', '?')}")
+    try:
+        from importlib.metadata import version as _pkg_version
+        _pw_ver = _pkg_version("playwright")
+    except Exception:
+        _pw_ver = "?"
+    say(f"  playwright  : {_pw_ver}")
     say(f"  stealth     : НЕ используется (как вы и просили)")
     say(f"  режим/URL   : {args.mode} → {url}")
     say(f"  headless    : {not args.headed}")
@@ -414,25 +437,37 @@ async def run(args):
                                            "post_len": len(req.post_data or "")})
                 say(f"   🌐 ЗАПРОС {req.method} {req.url} (body {len(req.post_data or '')} симв.)")
 
+        async def _read_stream(resp, u):
+            try:
+                body = await asyncio.wait_for(resp.text(), timeout=_net["stream_timeout"])
+            except Exception as e:
+                body = ""
+                _net["stream_error"] = repr(e)[:200]
+            _net["stream_done"] = True
+            _net["stream_body"] = body
+            say("   🌐 поток SSE завершён" if body else "   🌐 поток SSE не завершился за время ожидания")
+            for line in body.splitlines():
+                if line.startswith(("a2:", "a3:", "ae:")):
+                    say(f"      {line[:300]}")
+
         async def on_response(resp):
             try:
                 u = resp.url
                 ct = (resp.headers or {}).get("content-type", "")
                 if "/nextjs-api/stream" in u:
-                    body_head = ""
-                    try:
-                        body_head = await asyncio.wait_for(resp.text(), timeout=25)
-                    except Exception:
-                        body_head = "(поток не завершился за 25 с — это нормально для SSE)"
-                    _net["stream_resp"].append({"status": resp.status, "head": body_head[:2000]})
+                    _net["stream_status"] = resp.status
                     say(f"   🌐 ОТВЕТ {resp.status} {u}")
-                    for line in body_head.splitlines():
-                        if line.startswith(("a2:", "a3:", "ae:")):
-                            say(f"      {line[:300]}")
+                    asyncio.ensure_future(_read_stream(resp, u))
                 elif ct.startswith(("image/", "video/")):
-                    _net["media"].append({"url": u, "ct": ct,
-                                          "len": (resp.headers or {}).get("content-length", "?")})
-                    say(f"   🖼 медиа-ответ {ct} {u[:120]}")
+                    static = STATIC_MEDIA_RE.search(u) is not None
+                    size = (resp.headers or {}).get("content-length", "?")
+                    if static:
+                        return
+                    if _net["armed"]:
+                        _net["media"].append({"url": u, "ct": ct, "len": size})
+                        say(f"   🖼 медиа-ответ ПОСЛЕ отправки {ct} {u[:120]}")
+                    else:
+                        say(f"   · медиа до отправки (игнор) {ct} {u[:80]}")
             except Exception:
                 pass
 
@@ -444,6 +479,8 @@ async def run(args):
         try:
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             say(f"  HTTP статус документа: {resp.status if resp else '?'}")
+            if resp is not None and resp.status >= 400:
+                say("  ⚠️ документ ответил кодом ≥400 — проверьте 01_loaded.png: если UI Arena виден, это не блокировка")
             say(f"  URL после перехода    : {page.url}")
             if page.url.rstrip("/") in ("https://arena.ai", "https://arena.ai/"):
                 say("  ⚠️ Arena редиректнула на battle-страницу (обычно так бывает при пустой сессии)")
@@ -462,8 +499,11 @@ async def run(args):
         d = await snap(page, "01_loaded")
         if d:
             dump_lines(d, "  ")
-            stage("модалка согласия видна", d.get("termsText") or d.get("cookieText"),
-                  "terms=%s cookies=%s gate=%s" % (d.get("termsText"), d.get("cookieText"), d.get("gateEnterText")))
+            if d.get("termsText") or d.get("gateEnterText") or d.get("cookieText"):
+                stage("модалка согласия видна", True,
+                      "terms=%s cookies=%s gate=%s" % (d.get("termsText"), d.get("cookieText"), d.get("gateEnterText")))
+            else:
+                stage("модалка согласия", None, "не видна — composer должен быть доступен сразу")
             stage("логин-стена", not d.get("loginWall"),
                   "похоже, сессия протухла — нужны свежие cookies" if d.get("loginWall") else "нет")
             stage("капча/Cloudflare", not (d.get("captcha") or d.get("captchaText")), "не найдено")
@@ -471,8 +511,8 @@ async def run(args):
             stage("поле ввода найдено", bool(ta),
                   f"placeholder={ta['placeholder']!r}, disabled={ta['disabled']}, под курсором: {ta['topElement']}" if ta else "нет видимых textarea")
             comp = d.get("composer") or {}
-            stage("кнопка Send активна", comp.get("sendDisabled") is False,
-                  f"sendDisabled={comp.get('sendDisabled')} label={comp.get('sendLabel')!r}")
+            say(f"  Send до ввода промпта: disabled={comp.get('sendDisabled')} "
+                f"(это норма — поле пустое; проверяем после ввода на шаге 4)")
             blocked = [t["topElement"] for t in (d.get("textareas") or []) if "ПЕРЕКРЫВАЕТ" in str(t.get("topElement"))]
             if blocked:
                 stage("поле ввода не перекрыто", False, f"перекрывает: {blocked[0]}")
@@ -609,6 +649,7 @@ async def run(args):
             editor = await page.query_selector("textarea")
             if editor:
                 await editor.click()
+            _net["armed"] = True
             await page.keyboard.press("Enter")
             sent = False
             t_start = time.time()
@@ -628,6 +669,7 @@ async def run(args):
         # ── 6. отправка кнопкой ──────────────────────────────
         if not sent:
             hr("6. Отправка: клик по кнопке Send")
+            _net["armed"] = True
             try:
                 clicked = await page.evaluate(
                     r"""() => {
@@ -660,8 +702,9 @@ async def run(args):
             await asyncio.sleep(1)
             if i % 15 == 14:
                 say(f"  ...{i + 1}с: запросов к stream={len(_net['stream_req'])}, "
-                    f"медиа-ответов={len(_net['media'])}")
-            if _net["media"] and i > 10:
+                    f"поток завершён={_net['stream_done']}, медиа после отправки={len(_net['media'])}, "
+                    f"кнопок Download в DOM={await _count_downloads(page)}")
+            if _net["media"] and _net["stream_done"] and i > 10:
                 break
 
         say("")
@@ -672,9 +715,17 @@ async def run(args):
             say(f"    ← ответ {r['status']}; первые строки:")
             for line in r["head"].splitlines()[:6]:
                 say(f"        {line[:200]}")
-        say(f"  медиа-ответов (image/*, video/*): {len(_net['media'])}")
+        say(f"  статус потока: {_net['stream_status']}, завершён: {_net['stream_done']}"
+            + (f", ошибка чтения: {_net['stream_error']}" if _net["stream_error"] else ""))
+        if _net["stream_body"]:
+            say("  первые строки тела потока:")
+            for line in _net["stream_body"].splitlines()[:6]:
+                say(f"    {line[:200]}")
+        say(f"  медиа-ответов ПОСЛЕ отправки (без статики): {len(_net['media'])}")
         for m in _net["media"][:8]:
             say(f"    · {m}")
+        dl_count = await _count_downloads(page)
+        say(f"  кнопок Download в DOM (карточки результатов): {dl_count}")
 
         if _console:
             say(f"  консоль браузера (последние {min(len(_console), 15)}):")
@@ -685,8 +736,20 @@ async def run(args):
 
         stage("запрос к Arena ушёл", bool(_net["stream_req"]),
               "сеть молчит — промпт не отправлен" if not _net["stream_req"] else "ок")
-        stage("Arena вернула результат", bool(_net["media"]),
-              f"медиа-ответов: {len(_net['media'])}" if _net["media"] else "результата нет")
+        body = _net["stream_body"]
+        err_lines = [l for l in body.splitlines() if l.startswith(("a3:", "ae:"))]
+        if _net["media"] or dl_count:
+            stage("Arena вернула результат", True,
+                  f"файлов после отправки: {len(_net['media'])}, кнопок Download: {dl_count}")
+        elif err_lines:
+            stage("Arena вернула результат", False, "ошибка в потоке: " + err_lines[0][:200])
+        elif _net["stream_req"] and not _net["stream_done"]:
+            stage("Arena вернула результат", None,
+                  f"поток ещё открыт через {args.wait} с — генерация идёт или зависла. "
+                  f"Повторите с --wait 300 (видео — дольше)")
+        else:
+            stage("Arena вернула результат", False,
+                  "поток завершился без файла и без ошибки — смотрите 07_final.png и тело потока в report.txt")
 
         # финальный снимок и DOM
         await snap(page, "07_final")
@@ -719,7 +782,8 @@ async def run(args):
         say("    composer остаётся disabled. Нужно свежее согласие (кнопка Agree) или новые cookies.")
         say("  · «логин-стена» ❌ → протухла сессия: обновите cookies/arena_cookies.json.")
         say("  · «поле ввода перекрыто» → поверх composer баннер/модалка, Enter до него не доходит.")
-        say("  · «кнопка Send активна» ❌ → composer в disabled (сессия/недогрузка UI/модерация).")
+        say("  · «кнопка Send стала активной» ❌ → после ввода текста composer остался disabled (сессия/недогрузка UI/вложение ещё грузится).")
+        say("  · «Arena вернула результат» ⚠️ → поток ещё открыт: генерация идёт; повторите с --wait 300.")
         say("  · «промпт записан в поле» ❌ → не тот textarea или поле readonly.")
         say("  · «запрос к Arena ушёл» ❌ → сообщение не отправлено (см. пункты выше).")
 
@@ -738,7 +802,7 @@ def main():
     ap.add_argument("--no-cookies", action="store_true", help="не подгружать cookies (чистая сессия)")
     ap.add_argument("--headed", action="store_true", help="показать окно браузера (нужен X-сервер)")
     ap.add_argument("--fill-method", choices=["auto", "fill", "type", "js"], default="auto")
-    ap.add_argument("--wait", type=int, default=60, help="сколько секунд слушать сеть после отправки")
+    ap.add_argument("--wait", type=int, default=180, help="сколько секунд слушать сеть после отправки (видео — 300+)")
     args = ap.parse_args()
 
     t0 = time.time()

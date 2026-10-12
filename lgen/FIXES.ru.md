@@ -145,7 +145,7 @@ python selftest_arena.py edit animate
 # на сервере, рядом с ботом (там, где cookies/arena_cookies.json)
 python diagnose_arena.py --mode video   --prompt "drone over a mountain lake"
 python diagnose_arena.py --mode animate --image photo.jpg --prompt "gentle motion"
-python diagnose_arena.py --mode image   --prompt "neon city at night" --wait 90
+python diagnose_arena.py --mode image   --prompt "neon city at night"            # --wait по умолчанию 180 с
 python diagnose_arena.py --mode video   --prompt "..." --headed      # показать окно браузера
 ```
 
@@ -180,3 +180,17 @@ python diagnose_arena.py --mode video   --prompt "..." --headed      # пока�
 | `ARENA_DOWNLOAD_WAIT_SECONDS` | `25` | сколько ждать download-событие |
 | `ARENA_DOWNLOAD_CLICK_SECONDS` | `20` | пауза между кликами по «скачать» |
 | `ARENA_CONSENT_CHECK_SECONDS` | `15` | как часто перепроверять модалки |
+
+### Как читать отчёт `diagnose_arena.py` (v2)
+
+| Строка в отчёте | Что значит |
+|---|---|
+| ✅ / ❌ «промпт записан в поле» | текст реально попал в textarea |
+| ✅ / ❌ «кнопка Send стала активной» | composer разблокирован после ввода (это ключевой этап для «промпт не ушёл») |
+| ✅ «Enter отправил промпт» | URL сменился на `/c/…` или textarea очистилась — запрос ушёл |
+| ✅ «запрос к Arena ушёл» | в сети есть `POST /nextjs-api/stream/...` |
+| ✅ «Arena вернула результат» | после отправки появились файлы или кнопки Download в DOM |
+| ⚠️ «Arena вернула результат» | поток ещё открыт — генерация идёт; запустите с `--wait 300` |
+| ❌ «Arena вернула результат» + «ошибка в потоке» | `a3:`/`ae:` — текст ошибки Arena/модерации, см. строку в отчёте |
+
+Модалка Terms of Use теперь ищется только среди видимых `position: fixed` элементов; футер «Terms of Use / Privacy Policy» в сайдбаре больше не считается модалкой. Медиа из статики сайта (аватарки, CTA-видео, favicon, reCAPTCHA) не засчитываются как результат.
