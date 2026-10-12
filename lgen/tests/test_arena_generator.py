@@ -334,6 +334,10 @@ class FakePage:
         self.generating = True
         # реальная отправка уходит запросом на stream — это и видит бот
         self._emit("request", FakeNetRequest("POST", "https://arena.ai/nextjs-api/stream/create-evaluation"))
+        # ответ на отправку: 200 — принят, 429 и т. п. — отказ Arena
+        self._emit("response", FakeResponse("https://arena.ai/nextjs-api/stream/create-evaluation",
+                                            body=b"", ct="application/json",
+                                            status=getattr(self, "submit_status", 200)))
         if self.result_ready:
             self.generating = False
 
@@ -487,6 +491,7 @@ def make_generator(page: FakePage, tmp_path=None):
     page.on("download", gen._on_download)
     # запросы страницы — по ним бот подтверждает, что промпт ушёл (как в _attach_page_handlers)
     page.on("request", gen._on_request)
+    page.on("response", gen._on_response)
     gen._page_handlers_attached = True
 
     # ускоряем тайминги, чтобы тесты шли секунды, а не минуты
@@ -932,3 +937,25 @@ async def test_success_is_backed_by_stream_request():
     gen = make_generator(page)
     assert await gen.submit_prompt("neon city", mode="image") is True
     assert gen._stream_posts, "успех должен подтверждаться сетевым запросом"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Отказ Arena (HTTP 429) на отправку: раньше бот «ждал» и повторял Enter
+# ═══════════════════════════════════════════════════════════════════
+async def test_rate_limited_submit_is_reported_without_retries():
+    page = FakePage()
+    page.submit_status = 429
+    calls = []
+    orig = page._submit
+
+    async def counting():
+        calls.append(1)
+        await orig()
+
+    page._submit = counting
+    gen = make_generator(page)
+    gen.submit_check_seconds = 2.0
+    with pytest.raises(ag.ArenaRejectedError) as exc:
+        await gen.submit_prompt("некоторый промпт", mode="video")
+    assert "429" in str(exc.value)
+    assert len(calls) == 1  # без повторных Enter, которые усугубляют лимит

@@ -446,6 +446,8 @@ async def run(args):
             _net["stream_done"] = True
             _net["stream_body"] = body
             say("   🌐 поток SSE завершён" if body else "   🌐 поток SSE не завершился за время ожидания")
+            if (resp.status or 0) >= 400:
+                say(f"   ⛔ тело ответа {resp.status}: {body[:400]!r}")
             for line in body.splitlines():
                 if line.startswith(("a2:", "a3:", "ae:")):
                     say(f"      {line[:300]}")
@@ -506,14 +508,17 @@ async def run(args):
                 stage("модалка согласия", None, "не видна — composer должен быть доступен сразу")
             stage("логин-стена", not d.get("loginWall"),
                   "похоже, сессия протухла — нужны свежие cookies" if d.get("loginWall") else "нет")
-            stage("капча/Cloudflare", not (d.get("captcha") or d.get("captchaText")), "не найдено")
+            stage("капча/Cloudflare", not d.get("captchaText"),
+                  f"текст проверки: {bool(d.get('captchaText'))}; iframe капчи в DOM: {bool(d.get('captcha'))} "
+                  f"(невидимый бейдж reCAPTCHA — не проблема)")
             ta = next((t for t in (d.get("textareas") or []) if t["visible"]), None)
             stage("поле ввода найдено", bool(ta),
                   f"placeholder={ta['placeholder']!r}, disabled={ta['disabled']}, под курсором: {ta['topElement']}" if ta else "нет видимых textarea")
             comp = d.get("composer") or {}
             say(f"  Send до ввода промпта: disabled={comp.get('sendDisabled')} "
                 f"(это норма — поле пустое; проверяем после ввода на шаге 4)")
-            blocked = [t["topElement"] for t in (d.get("textareas") or []) if "ПЕРЕКРЫВАЕТ" in str(t.get("topElement"))]
+            blocked = [t["topElement"] for t in (d.get("textareas") or [])
+                       if t.get("visible") and "ПЕРЕКРЫВАЕТ" in str(t.get("topElement"))]
             if blocked:
                 stage("поле ввода не перекрыто", False, f"перекрывает: {blocked[0]}")
 
@@ -734,6 +739,9 @@ async def run(args):
         if _page_errors:
             say(f"  ошибки страницы: {_page_errors[:5]}")
 
+        st_code = _net["stream_status"]
+        stage("Arena приняла промпт (HTTP 2xx)", (st_code is not None and st_code < 400),
+              f"HTTP {st_code}" if st_code else "ответа на отправку не было")
         stage("запрос к Arena ушёл", bool(_net["stream_req"]),
               "сеть молчит — промпт не отправлен" if not _net["stream_req"] else "ок")
         body = _net["stream_body"]
@@ -741,6 +749,9 @@ async def run(args):
         if _net["media"] or dl_count:
             stage("Arena вернула результат", True,
                   f"файлов после отправки: {len(_net['media'])}, кнопок Download: {dl_count}")
+        elif (_net["stream_status"] or 0) >= 400:
+            stage("Arena вернула результат", False,
+                  f"Arena отклонила запрос: HTTP {_net['stream_status']} — лимит/блокировка на стороне Arena; тело ответа выше")
         elif err_lines:
             stage("Arena вернула результат", False, "ошибка в потоке: " + err_lines[0][:200])
         elif _net["stream_req"] and not _net["stream_done"]:

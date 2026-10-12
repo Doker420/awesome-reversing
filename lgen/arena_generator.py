@@ -148,6 +148,23 @@ def _ext_from_url(url: str, default: str = ".png") -> str:
     return default
 
 
+class ArenaRejectedError(Exception):
+    """Arena отказала в отправке промпта (HTTP 4xx/5xx на POST /nextjs-api/stream)."""
+
+    def __init__(self, status: int, body: str = ""):
+        self.status = status
+        self.body = body
+        if status == 429:
+            hint = ("Это лимит или блокировка на стороне Arena (слишком много запросов, лимит аккаунта или IP). "
+                    "Повторные попытки в эту минуту не помогут — подождите и попробуйте позже.")
+        else:
+            hint = "Arena отклонила запрос — ответ ниже."
+        text = f"Arena отклонила отправку промпта: HTTP {status}. {hint}"
+        if body:
+            text += f" Ответ Arena: {body[:200]}"
+        super().__init__(text)
+
+
 class ArenaGenerator:
     def __init__(self):
         self.playwright = None
@@ -179,6 +196,8 @@ class ArenaGenerator:
         self._saved_hashes = set()
         # Доказательство отправки: время POST на /nextjs-api/stream и отметка начала submit_prompt
         self._stream_posts = []
+        self._stream_rejections = []
+        self._stream_accepts = []
         self._submit_mark = 0.0
 
         # Тайминги (секунды) — вынесены в атрибуты, чтобы их можно было
@@ -296,6 +315,35 @@ class ArenaGenerator:
         except Exception:
             pass
 
+    async def _record_stream_response(self, response):
+        """Ответ на POST /nextjs-api/stream: 2xx — промпт принят, 4xx/5xx — отказ Arena (например 429)."""
+        try:
+            method = response.request.method
+        except Exception:
+            method = "POST"
+        if method != "POST":
+            return
+        status = int(getattr(response, "status", 0) or 0)
+        if status >= 400:
+            body = ""
+            try:
+                body = (await response.text())[:300]
+            except Exception:
+                pass
+            self._stream_rejections.append({"ts": time.time(), "status": status, "body": body})
+            logger.warning(f"Arena ответила HTTP {status} на отправку промпта: {body[:200]}")
+        elif status:
+            self._stream_accepts.append(time.time())
+
+    def _stream_rejection_since_mark(self):
+        for r in self._stream_rejections:
+            if r["ts"] >= self._submit_mark:
+                return r
+        return None
+
+    def _stream_accepted_since_mark(self) -> bool:
+        return any(t >= self._submit_mark for t in self._stream_accepts)
+
     def _request_sent_since_mark(self) -> bool:
         return any(t >= self._submit_mark for t in self._stream_posts)
 
@@ -356,6 +404,8 @@ class ArenaGenerator:
     async def _handle_response(self, response):
         try:
             url = response.url
+            if "/nextjs-api/stream" in url:
+                await self._record_stream_response(response)
             if not self._capture_enabled and not self._media_kind(url, ""):
                 return
 
@@ -1021,9 +1071,13 @@ class ArenaGenerator:
         """Ждём подтверждения, что промпт реально ушёл."""
         deadline = time.time() + float(seconds if seconds is not None else self.submit_check_seconds)
         while time.time() < deadline:
-            # 1) сеть: POST на /nextjs-api/stream ушёл после начала отправки — самое надёжное
-            if self._request_sent_since_mark():
-                logger.info("Отправка подтверждена: POST /nextjs-api/stream ✅")
+            # 0) Arena явно отказала (HTTP 4xx/5xx) — не ждём и не повторяем, сообщаем причину
+            rej = self._stream_rejection_since_mark()
+            if rej:
+                raise ArenaRejectedError(rej["status"], rej["body"])
+            # 1) POST на /nextjs-api/stream получил ответ 2xx — промпт принят
+            if self._stream_accepted_since_mark():
+                logger.info("Отправка подтверждена: POST /nextjs-api/stream принят (HTTP 2xx) ✅")
                 return True
             st = await self._generation_state(prompt)
             # 2) идёт генерация: кнопка «Stop generation»
@@ -1215,6 +1269,8 @@ class ArenaGenerator:
                     if await self._wait_submission(prompt, seconds=self.submit_check_seconds):
                         logger.info(f"Generation started via Enter ✅ (попытка {attempt})")
                         return True
+            except ArenaRejectedError:
+                raise
             except Exception as e:
                 logger.debug(f"Enter submit failed: {e}")
 
