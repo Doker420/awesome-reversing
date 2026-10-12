@@ -107,6 +107,9 @@ python selftest_arena.py edit animate
    (файл пишется автоматически после закрытия модалки согласия).
 4. Если падает модерация — теперь приходит текст ошибки Arena (`a3:`/`ae:`),
    например `moderation_blocked`.
+5. Если ломается уже на этапе открытия страницы — обновите Playwright
+   (`pip install -U playwright && playwright install chromium`): текущий pin
+   `playwright==1.40.0` — 2023 год, а Arena активно меняет фронтенд.
 
 ## Новые переменные окружения (все опциональны)
 
