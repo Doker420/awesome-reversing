@@ -635,6 +635,12 @@ def apply_patch(text: str) -> tuple:
     """Возвращает (новый_текст, применённые, уже_применённые)."""
     applied, skipped = [], []
     for name, old, new in STEPS:
+        # Старые генераторы не имеют _begin_generation(): граница задачи — start_capture.
+        if name.startswith("2.") and "    def _begin_generation(self):" not in text:
+            old = '        self._download_dir = download_dir\n        self._saved_hashes = set()\n'
+            new = old + ('        self._last_upload_path = None\n'
+                         '        self._upload_digests = set()\n'
+                         '        self._reference_media = set()\n')
         if new in text:
             skipped.append(name)
             continue
@@ -644,6 +650,17 @@ def apply_patch(text: str) -> tuple:
                      f"Похоже, файл уже правился вручную. Ничего не изменено.")
         text = text.replace(old, new, 1)
         applied.append(name)
+    # В старой версии upload_image() также не запоминал путь исходника.
+    anchor = '        logger.info(f"Uploading image: {image_path}...")\n'
+    replacement = anchor + '        self._last_upload_path = image_path\n'
+    name = "11. Запомнить путь исходного вложения"
+    if replacement in text:
+        skipped.append(name)
+    elif text.count(anchor) == 1:
+        text = text.replace(anchor, replacement, 1)
+        applied.append(name)
+    else:
+        sys.exit("Не найден уникальный фрагмент upload_image. Ничего не изменено.")
     return text, applied, skipped
 
 
