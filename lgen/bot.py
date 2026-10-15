@@ -29,6 +29,8 @@ from config import (
     REFERRALS_NEEDED, REFERRAL_BONUS_TOKENS,
 )
 from database import Database
+import site_clone
+from site_clone import CloneRefused
 from arena_generator import ArenaGenerator
 from admin import is_admin
 from payments import create_platega_payment, create_cryptobot_payment, check_and_activate_payment
@@ -166,6 +168,12 @@ def kb_generate_menu(tokens: int) -> InlineKeyboardMarkup:
             text=f"💡 Промпт  {_cost_tag(COST_TEXT)}",
             callback_data="mode_prompt"
         ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🧬 Клон сайта  {_cost_tag(COST_LANDING)}",
+            callback_data="mode_clone"
+        )
     )
     builder.row(
         InlineKeyboardButton(text="💎 Купить токены", callback_data="buy"),
@@ -493,7 +501,7 @@ async def cb_history(callback: CallbackQuery):
         return
 
     mode_icons = {
-        "landing": "🌐", "image": "🖼", "video": "🎬",
+        "landing": "🌐", "clone": "🧬", "image": "🖼", "video": "🎬",
         "text": "✍️", "prompt": "💡", "code": "🌐",
     }
     lines = ["📋 <b>Последние генерации:</b>\n"]
@@ -562,6 +570,19 @@ MODE_CONFIG = {
         "mode": "landing", "cost": COST_LANDING,
         "icon": "🌐", "name": "лендинг",
         "hint": "Опишите желаемый лендинг:\n<i>Пример: «Современный лендинг для фитнес-клуба с тёмной темой»</i>",
+    },
+    "mode_clone": {
+        "mode": "clone", "cost": COST_LANDING,
+        "icon": "🧬", "name": "клон сайта",
+        "hint": (
+            "Пришлите ссылку на <b>свой</b> сайт или сайт, на копирование дизайна которого у вас есть разрешение.\n"
+            "<i>Пример: https://example.com</i>\n\n"
+            "⚠️ <b>Не копируйте запрещённый контент</b>: чужие логотипы, фирменные тексты и изображения, "
+            "страницы входа, оплаты и банков. Такие запросы отклоняются.\n"
+            "Мы не публикуем и не хостим страницы: вы получаете архив.\n"
+            "Результат создаётся для дизайна и фронтенд-работы. <b>LGen не несёт ответственности</b> "
+            "за использование результата и за нарушение прав третьих лиц."
+        ),
     },
     "mode_image": {
         "mode": "image", "cost": COST_IMAGE,
@@ -685,12 +706,96 @@ async def process_prompt(message: Message, state: FSMContext):
     data = await state.get_data()
     mode = data.get("mode", "landing")
     cost = data.get("cost", COST_LANDING)
+    if mode == "clone":
+        await _handle_clone_url(message, state)
+        return
     await state.clear()
     await _run_generation(message, message.text, mode, cost, extra_data=data)
 
 
-async def _run_generation(message: Message, prompt: str, mode: str, cost: int, extra_data: dict = None):
-    user_id = message.from_user.id
+CLONE_CONFIRM_TEXT = (
+    "🧬 <b>Клон сайта</b>\n\n"
+    "Адрес: <code>{url}</code>\n"
+    "Будет списано: <code>{cost}</code> токенов\n\n"
+    "Подтвердите, что вы владелец сайта или имеете разрешение владельца на копирование дизайна.\n\n"
+    "⚠️ Запрещено копировать чужие логотипы, товарные знаки, тексты, изображения, "
+    "а также страницы входа, оплаты и банков. Такие адреса отклоняются автоматически.\n"
+    "Мы не публикуем и не хостим страницы. Результат: архив.\n"
+    "<i>LGen не несёт ответственности за использование результата и за нарушение прав третьих лиц.</i>"
+)
+
+
+async def _handle_clone_url(message: Message, state: FSMContext):
+    import html as _html
+    try:
+        url = await asyncio.to_thread(site_clone.validate_url, message.text or "")
+    except CloneRefused as e:
+        await message.answer(
+            f"⛔ {_html.escape(str(e))}\n\nПришлите другую ссылку или вернитесь в меню.",
+            reply_markup=kb_back("gen_menu"), parse_mode="HTML"
+        )
+        return
+    await state.update_data(clone_url=url)
+    await message.answer(
+        CLONE_CONFIRM_TEXT.format(url=_html.escape(url), cost=fmt_tokens(COST_LANDING)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтверждаю, у меня есть права", callback_data="clone_confirm")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="gen_menu")],
+        ]),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "clone_confirm")
+async def cb_clone_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    url = data.get("clone_url")
+    user_id = callback.from_user.id
+    if not url:
+        await callback.answer("Ссылка не найдена. Начните заново.", show_alert=True)
+        return
+
+    u = await db.get_user(user_id)
+    tokens = (u or {}).get("tokens", 0)
+    if tokens < COST_LANDING:
+        await callback.answer(
+            f"❌ Недостаточно токенов. Нужно: {fmt_tokens(COST_LANDING)}", show_alert=True)
+        return
+
+    reason = site_clone.clone_limiter.check(user_id)
+    if reason:
+        await callback.answer(reason, show_alert=True)
+        return
+
+    await state.clear()
+    await callback.answer()
+    site_clone.clone_limiter.record(user_id)
+    status = await callback.message.answer("🔎 Загружаю страницу для анализа дизайна…")
+    try:
+        snap = await site_clone.fetch_snapshot(url)
+    except CloneRefused as e:
+        await status.edit_text(f"⛔ {e}\n\nТокены не списаны.")
+        return
+    except Exception as e:
+        logger.warning(f"clone fetch failed user={user_id} host={site_clone.host_of(url)}: {type(e).__name__}")
+        await status.edit_text("⛔ Не удалось загрузить сайт. Токены не списаны.")
+        return
+
+    clone_prompt = site_clone.build_clone_prompt(snap)
+    logger.info(f"clone start user={user_id} host={site_clone.host_of(url)} prompt_chars={len(clone_prompt)}")
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await _run_generation(
+        callback.message, url, "clone", COST_LANDING,
+        extra_data={"clone_prompt": clone_prompt}, user_id=user_id,
+    )
+
+
+async def _run_generation(message: Message, prompt: str, mode: str, cost: int, extra_data: dict = None,
+                          user_id: int = None):
+    user_id = user_id or message.from_user.id
     extra_data = extra_data or {}
     u = await db.get_user(user_id)
     if not u:
@@ -742,7 +847,7 @@ async def _run_generation(message: Message, prompt: str, mode: str, cost: int, e
             return
 
         mode_icons = {
-            "landing": "🌐", "image": "🖼", "video": "🎬",
+            "landing": "🌐", "clone": "🧬", "image": "🖼", "video": "🎬",
             "text": "✍️", "prompt": "💡",
             "image_edit": "🎨", "image_to_video": "🪄",
         }
@@ -762,6 +867,8 @@ async def _run_generation(message: Message, prompt: str, mode: str, cost: int, e
 
             if mode in ("landing", "code"):
                 result_path = await generator.generate_landing(prompt)
+            elif mode == "clone":
+                result_path = await generator.generate_landing(extra_data.get("clone_prompt") or prompt)
             elif mode == "image":
                 result_path = await generator.generate_image(prompt)
             elif mode == "image_edit":
