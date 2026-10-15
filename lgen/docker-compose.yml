@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  # ──────────────────────────────────────────────
+  # REST API (arena генератор)
+  # ──────────────────────────────────────────────
+  api:
+    build: .
+    container_name: lgen_api
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./cookies:/app/cookies
+      - ./generated:/app/generated
+    ports:
+      - "8000:8000"
+    shm_size: "2gb"            # Playwright требует много /dev/shm
+    command: >
+      uvicorn api_server:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 1
+      --log-level info
+
+  # ──────────────────────────────────────────────
+  # Telegram Bot
+  # ──────────────────────────────────────────────
+  bot:
+    build: .
+    container_name: lgen_bot
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - api
+    volumes:
+      - ./cookies:/app/cookies
+      - ./generated:/app/generated
+    shm_size: "2gb"
+    command: python bot.py
